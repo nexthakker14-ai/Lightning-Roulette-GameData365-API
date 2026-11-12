@@ -1,15 +1,10 @@
 # -*- coding: utf-8 -*-
-"""
-GameData365 -> Lightning Roulette rules -> Telegram.
+"""GameData365 -> Lightning Roulette rules -> Telegram.
 
-Rules are evaluated on each NEW, non-backfilled result:
-1) 6 same colours in a row -> signal the opposite colour.
-2) 6 same parity results in a row -> signal the opposite parity.
-3) 6 results in the same half (1-18 or 19-36) -> signal the opposite half.
-4) 4 results in the same dozen (1-12 / 13-24 / 25-36) -> signal either of the other two dozens.
-
-Zero breaks all runs and is never treated as red/black, even/odd, half, or dozen.
-Signals are informational; the bot does not place bets.
+Signals are created only when a qualifying run is completed. Each signal is
+tracked against the next 10 roulette results and closed on the first hit.
+Zero breaks every run, but still counts as one of the 10 attempts for an
+already-open signal.
 """
 import os
 import json
@@ -38,7 +33,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("lightning-roulette-rules")
 session = requests.Session()
-session.headers.update({"User-Agent": "LightningRoulette-RulesBot/1.0"})
+session.headers.update({"User-Agent": "LightningRoulette-RulesBot/2.0"})
+
+RED_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
+DOZEN_LABELS = {1: "1–12", 2: "13–24", 3: "25–36"}
+
+
+def empty_state():
+    return {"last_result_id": None, "history": [], "seen_ids": [], "active_signals": []}
 
 
 def load_state():
@@ -49,12 +51,13 @@ def load_state():
         state.setdefault("last_result_id", None)
         state.setdefault("history", [])
         state.setdefault("seen_ids", [])
+        state.setdefault("active_signals", [])
         return state
     except FileNotFoundError:
-        return {"last_result_id": None, "history": [], "seen_ids": []}
+        return empty_state()
     except Exception:
         log.exception("Cannot read state file; starting fresh")
-        return {"last_result_id": None, "history": [], "seen_ids": []}
+        return empty_state()
 
 
 def save_state(state):
@@ -118,13 +121,7 @@ def parse_record(record):
     if backfilled is True or str(backfilled).lower() in {"true", "1", "yes"}:
         return None
 
-    if number == 0:
-        color = "зелений"
-    elif number in {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}:
-        color = "червоний"
-    else:
-        color = "чорний"
-
+    color = "зелений" if number == 0 else ("червоний" if number in RED_NUMBERS else "чорний")
     rid = str(round_id) if round_id is not None else f"{timestamp}:{number}"
     if rid in {"None:", ":None"}:
         rid = f"{TABLE_ID}:{timestamp}:{number}"
@@ -135,59 +132,83 @@ def category(number):
     if number == 0:
         return None
     return {
-        "color": "червоний" if number in {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36} else "чорний",
+        "color": "червоне" if number in RED_NUMBERS else "чорне",
         "parity": "парне" if number % 2 == 0 else "непарне",
         "half": "1–18" if number <= 18 else "19–36",
         "dozen": 1 if number <= 12 else (2 if number <= 24 else 3),
     }
 
 
-def evaluate_rules(history, current):
-    """Return signal messages triggered by the just-arrived result."""
-    n = current["number"]
-    cats = category(n)
-    if cats is None:
+def run_length(history, current, key):
+    """Length of the current uninterrupted category run, including current."""
+    current_cat = category(current["number"])
+    if current_cat is None:
+        return 0, None
+    value = current_cat[key]
+    count = 0
+    for item in reversed(history):
+        item_cat = category(item["number"])
+        if item_cat is None or item_cat[key] != value:
+            break
+        count += 1
+    return count + 1, value
+
+
+def build_new_signals(history, current):
+    """Return signals only on the exact result that completes each series."""
+    if current["number"] == 0:
         return []
 
-    signals = []
-    # Rule 1: 6 same roulette colours, then bet opposite colour.
-    for key, count, rule_name in [
-        ("color", 6, "Колір"),
-        ("parity", 6, "Парність"),
-        ("half", 6, "Діапазон"),
-        ("dozen", 4, "Дюжина"),
-    ]:
-        if len(history) < count:
-            continue
-        recent = history[-count:]
-        recent_cats = [category(x["number"]) for x in recent]
-        if any(x is None for x in recent_cats):
-            continue
-        values = [x[key] for x in recent_cats]
-        if len(set(values)) != 1:
+    rules = [
+        ("color", 6, 1),
+        ("parity", 6, 2),
+        ("half", 6, 3),
+        ("dozen", 4, 4),
+    ]
+    result = []
+    for key, threshold, rule_no in rules:
+        length, value = run_length(history, current, key)
+        if length != threshold:
             continue
 
-        last_value = values[-1]
         if key == "color":
-            target = "чорний" if last_value == "червоний" else "червоний"
-            signals.append((1, f"🎨 Колір: 6 підряд {last_value}. Сигнал на наступний спін: {target}."))
+            targets = ["чорне" if value == "червоне" else "червоне"]
+            condition = f"6 червоних" if value == "червоне" else "6 чорних"
+            target_text = targets[0].capitalize()
+            title = "Колір"
         elif key == "parity":
-            target = "непарне" if last_value == "парне" else "парне"
-            signals.append((2, f"🔢 Парність: 6 підряд — {last_value}. Сигнал на наступний спін: {target}."))
+            targets = ["непарне" if value == "парне" else "парне"]
+            condition = f"6 {value}"
+            target_text = targets[0].capitalize()
+            title = "Парність"
         elif key == "half":
-            target = "19–36" if last_value == "1–18" else "1–18"
-            signals.append((3, f"📊 Діапазон: 6 підряд у {last_value}. Сигнал на наступний спін: {target}."))
-        elif key == "dozen":
-            targets = [d for d in (1, 2, 3) if d != last_value]
-            labels = {1: "1–12", 2: "13–24", 3: "25–36"}
-            signals.append((4, f"🟦 Дюжина: 4 підряд у {labels[last_value]}. Сигнал на наступний спін: {labels[targets[0]]} або {labels[targets[1]]}."))
+            targets = ["19–36" if value == "1–18" else "1–18"]
+            condition = f"6 чисел {value}"
+            target_text = targets[0]
+            title = "Діапазон"
+        else:
+            targets = [d for d in (1, 2, 3) if d != value]
+            condition = f"4 з {DOZEN_LABELS[value]}"
+            target_text = " та ".join(DOZEN_LABELS[d] for d in targets)
+            title = "Дюжини"
 
-    return signals
+        result.append({
+            "id": f"{current['id']}:{rule_no}",
+            "rule_no": rule_no,
+            "rule_name": title,
+            "condition": condition,
+            "targets": targets,
+            "target_text": target_text,
+            "attempts": 0,
+            "trigger_number": current["number"],
+        })
+    return result
 
 
 def send_telegram(message):
     if not TG_TOKEN or not TG_CHAT_IDS:
         log.warning("Telegram credentials are not configured; message only logged")
+        log.info("TELEGRAM MESSAGE:\n%s", message)
         return True
     ok = True
     for chat_id in TG_CHAT_IDS:
@@ -204,6 +225,49 @@ def send_telegram(message):
             ok = False
             log.exception("Telegram delivery failed for chat %s", chat_id)
     return ok
+
+
+def signal_message(signal, current):
+    return (
+        "🚨 LIGHTNING ROULETTE — СИГНАЛ\n"
+        f"Правило №{signal['rule_no']} — {signal['rule_name']}\n"
+        f"Умова: {signal['condition']}\n"
+        f"Ставка: {signal['target_text']}\n"
+        f"Останній результат: {current['number']} — {current['color']}\n"
+        "Перевірка: наступні 10 чисел."
+    )
+
+
+def settle_active_signals(state, current):
+    """Check each existing signal against this next spin, first hit wins."""
+    remaining = []
+    cats = category(current["number"])
+    for signal in state["active_signals"]:
+        signal["attempts"] = int(signal.get("attempts", 0)) + 1
+        attempt = signal["attempts"]
+        won = cats is not None and cats["dozen" if signal["rule_no"] == 4 else {
+            1: "color", 2: "parity", 3: "half"
+        }[signal["rule_no"]]] in signal["targets"]
+
+        if won:
+            target_unit = "-му"
+            message = (
+                f"🟢 WIN — виграш на {attempt}{target_unit} числі\n"
+                f"Правило №{signal['rule_no']} — {signal['rule_name']}\n"
+                f"Випало: {current['number']} — {current['color']}\n"
+                f"Ціль: {signal['target_text']}"
+            )
+            send_telegram(message)
+        elif attempt >= 10:
+            message = (
+                "🔴 LOSS — за 10 чисел успіху немає\n"
+                f"Правило №{signal['rule_no']} — {signal['rule_name']}\n"
+                f"Ставка: {signal['target_text']}"
+            )
+            send_telegram(message)
+        else:
+            remaining.append(signal)
+    state["active_signals"] = remaining
 
 
 def fetch_live():
@@ -227,46 +291,40 @@ def handle_payload(payload, state):
         log.debug("API JSON: %s", json.dumps(payload, ensure_ascii=False)[:4000])
         return
 
-    # Keep API order safe: sort by timestamp when numeric; otherwise retain response order.
+    # API returns newest first on the supported feed; process chronologically.
     records.reverse()
     seen = set(state.get("seen_ids", []))
     history = state.get("history", [])
+
     for item in records:
         if item["id"] in seen:
             continue
 
-        # Add to sequence and evaluate only the current, non-backfilled result.
+        # Existing signals are checked first: this spin is attempt 1..10 for them.
+        settle_active_signals(state, item)
+
+        # Detect completed runs using only prior history plus the current result.
+        new_signals = build_new_signals(history, item)
+        for signal in new_signals:
+            if not send_telegram(signal_message(signal, item)):
+                log.error("Could not deliver signal %s", signal["id"])
+                # Keep processing state; Telegram failures are visible in logs.
+            state["active_signals"].append(signal)
+
         history.append({"id": item["id"], "number": item["number"], "timestamp": item["timestamp"]})
         history = history[-100:]
         seen.add(item["id"])
-
-        label = f"{item['number']} — {item['color']}"
-        log.info("New spin: %s | round=%s", label, item["id"])
-        signals = evaluate_rules(history, item)
-        if signals:
-            for rule_no, detail in signals:
-                message = (
-                    "🚨 LIGHTNING ROULETTE — СИГНАЛ\n"
-                    f"Правило №{rule_no}\n"
-                    f"Останній результат: {label}\n"
-                    f"{detail}\n"
-                    "Наступний спін; автоматичні ставки не виконуються."
-                )
-                if not send_telegram(message):
-                    # Do not mark this round as processed; it will retry next poll.
-                    return
-        else:
-            log.info("No rule triggered for this result.")
-
         state["last_result_id"] = item["id"]
         state["history"] = history
         state["seen_ids"] = list(seen)[-500:]
         save_state(state)
 
+        log.info("New spin: %s | active signals=%s", f"{item['number']} — {item['color']}", len(state["active_signals"]))
+
 
 def main():
     log.info("Started | provider=%s | table=%s | poll=%ss", PROVIDER, TABLE_ID, POLL_SECONDS)
-    log.info("Rules enabled: 1 colour x6; 2 parity x6; 3 half x6; 4 dozen x4")
+    log.info("Rules: colour x6; parity x6; range x6; dozen x4; 10 attempts; no pre-alerts")
     state = load_state()
     while True:
         try:
